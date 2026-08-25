@@ -10,24 +10,27 @@
 #import <mach/mach_time.h>
 #import <dlfcn.h>
 #import <math.h>
+#import <objc/message.h>
 #import <unistd.h>
 
 // iPhoneOS SDK 不公开这些 HID 声明，运行时从 IOKit 动态解析，兼容 iOS 15.0-16.5。
 typedef CFTypeRef IOHIDEventRef;
-typedef CFTypeRef IOHIDEventSystemClientRef;
-typedef IOHIDEventSystemClientRef (*HIDClientCreateFn)(CFAllocatorRef allocator);
-typedef void (*HIDDispatchEventFn)(IOHIDEventSystemClientRef client, IOHIDEventRef event);
 typedef void (*HIDAppendEventFn)(IOHIDEventRef parent, IOHIDEventRef child, uint32_t options);
 typedef void (*HIDSetIntegerValueFn)(IOHIDEventRef event, uint32_t field, CFIndex value);
 typedef void (*HIDSetFloatValueFn)(IOHIDEventRef event, uint32_t field, double value);
-typedef void (*HIDSetSenderIDFn)(IOHIDEventRef event, uint64_t senderID);
 typedef IOHIDEventRef (*HIDCreateDigitizerFn)(CFAllocatorRef, uint64_t, uint32_t,
     uint32_t, uint32_t, uint32_t, uint32_t, double, double, double, double,
     double, bool, bool, uint32_t);
 typedef IOHIDEventRef (*HIDCreateFingerFn)(CFAllocatorRef, uint64_t, uint32_t,
     uint32_t, uint32_t, double, double, double, double, double, bool, bool,
     uint32_t);
-typedef void (*UIEnqueueHIDEventFn)(IOHIDEventRef event);
+typedef void (*HIDSetDigitizerInfoFn)(IOHIDEventRef event, uint32_t contextID,
+    uint8_t systemGesturePossible, uint8_t isSystemGestureStateChangeEvent,
+    CFStringRef displayUUID, CFTimeInterval initialTouchTimestamp, float maxForce);
+
+@interface UIApplication (BAutoSwipePrivate)
+- (void)_enqueueHIDEvent:(IOHIDEventRef)event;
+@end
 
 enum {
     kBDHIDRange = 1u << 0,
@@ -65,24 +68,22 @@ static NSUInteger g_buttonAttachGeneration = 0;
 static id g_didBecomeActiveObserver = nil;
 static id g_windowDidBecomeVisibleObserver = nil;
 
-static NSString *const kBAutoSwipeVersion = @"1.0.3-touchtest";
+static NSString *const kBAutoSwipeVersion = @"1.0.4-foregroundtest";
 static const CGFloat kFloatingButtonSize = 60.0;
 static const CGFloat kFloatingButtonMargin = 12.0;
 static const NSInteger kWindowAttachRetryCount = 60;
 static const NSTimeInterval kWindowAttachRetryDelay = 0.5;
 
 static void *g_iokitHandle = NULL;
-static IOHIDEventSystemClientRef g_hidClient = NULL;
-static HIDClientCreateFn g_createClient = NULL;
-static HIDDispatchEventFn g_dispatchEvent = NULL;
+static void *g_backboardHandle = NULL;
 static HIDAppendEventFn g_appendEvent = NULL;
 static HIDSetIntegerValueFn g_setIntegerValue = NULL;
 static HIDSetFloatValueFn g_setFloatValue = NULL;
-static HIDSetSenderIDFn g_setSenderID = NULL;
 static HIDCreateDigitizerFn g_createDigitizer = NULL;
 static HIDCreateFingerFn g_createFinger = NULL;
-static UIEnqueueHIDEventFn g_enqueueEvent = NULL;
-static BOOL g_usingSystemDispatch = NO;
+static HIDSetDigitizerInfoFn g_setDigitizerInfo = NULL;
+
+static UIWindow *foregroundAppWindow(void);
 
 // ===== IOHIDEvent 触摸模拟 =====
 
@@ -96,30 +97,38 @@ static BOOL hidBackendReady(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         g_iokitHandle = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL);
-        if (!g_iokitHandle) return;
+        g_backboardHandle = dlopen("/System/Library/PrivateFrameworks/BackBoardServices.framework/BackBoardServices",
+                                  RTLD_NOW | RTLD_LOCAL);
+        if (g_iokitHandle) {
+            g_appendEvent = (HIDAppendEventFn)dlsym(g_iokitHandle, "IOHIDEventAppendEvent");
+            g_setIntegerValue = (HIDSetIntegerValueFn)dlsym(g_iokitHandle, "IOHIDEventSetIntegerValue");
+            g_setFloatValue = (HIDSetFloatValueFn)dlsym(g_iokitHandle, "IOHIDEventSetFloatValue");
+            g_createDigitizer = (HIDCreateDigitizerFn)dlsym(g_iokitHandle, "IOHIDEventCreateDigitizerEvent");
+            g_createFinger = (HIDCreateFingerFn)dlsym(g_iokitHandle, "IOHIDEventCreateDigitizerFingerEvent");
+        }
+        if (g_backboardHandle) {
+            g_setDigitizerInfo = (HIDSetDigitizerInfoFn)dlsym(g_backboardHandle,
+                                                              "BKSHIDEventSetDigitizerInfo");
+        }
 
-        g_createClient = (HIDClientCreateFn)dlsym(g_iokitHandle, "IOHIDEventSystemClientCreate");
-        g_dispatchEvent = (HIDDispatchEventFn)dlsym(g_iokitHandle, "IOHIDEventSystemClientDispatchEvent");
-        g_appendEvent = (HIDAppendEventFn)dlsym(g_iokitHandle, "IOHIDEventAppendEvent");
-        g_setIntegerValue = (HIDSetIntegerValueFn)dlsym(g_iokitHandle, "IOHIDEventSetIntegerValue");
-        g_setFloatValue = (HIDSetFloatValueFn)dlsym(g_iokitHandle, "IOHIDEventSetFloatValue");
-        g_setSenderID = (HIDSetSenderIDFn)dlsym(g_iokitHandle, "IOHIDEventSetSenderID");
-        g_createDigitizer = (HIDCreateDigitizerFn)dlsym(g_iokitHandle, "IOHIDEventCreateDigitizerEvent");
-        g_createFinger = (HIDCreateFingerFn)dlsym(g_iokitHandle, "IOHIDEventCreateDigitizerFingerEvent");
-        g_enqueueEvent = (UIEnqueueHIDEventFn)dlsym(RTLD_DEFAULT, "_UIEnqueueHIDEvent");
-        if (g_createClient) g_hidClient = g_createClient(kCFAllocatorDefault);
-        g_usingSystemDispatch = g_hidClient != NULL && g_dispatchEvent != NULL;
-
-        NSLog(@"[BAutoSwipe] %@ HID backend selected=%@ enqueue=%d system=%d",
-              kBAutoSwipeVersion, g_usingSystemDispatch ? @"system" : @"enqueue",
-              g_enqueueEvent != NULL,
-              g_hidClient != NULL && g_dispatchEvent != NULL);
+        BOOL appEnqueue = [[UIApplication sharedApplication] respondsToSelector:@selector(_enqueueHIDEvent:)];
+        NSLog(@"[BAutoSwipe] %@ foreground backend iokit=%d backboard=%d digitizerInfo=%d appEnqueue=%d",
+              kBAutoSwipeVersion, g_iokitHandle != NULL, g_backboardHandle != NULL,
+              g_setDigitizerInfo != NULL, appEnqueue);
     });
 
     BOOL canCreate = g_appendEvent && g_setIntegerValue && g_setFloatValue &&
-                     g_setSenderID && g_createDigitizer && g_createFinger;
-    BOOL canDispatch = g_enqueueEvent || (g_hidClient && g_dispatchEvent);
-    return canCreate && canDispatch;
+                     g_createDigitizer && g_createFinger;
+    BOOL canTargetWindow = g_setDigitizerInfo &&
+        [[UIApplication sharedApplication] respondsToSelector:@selector(_enqueueHIDEvent:)];
+    return canCreate && canTargetWindow;
+}
+
+static uint32_t contextIDForWindow(UIWindow *window) {
+    SEL selector = NSSelectorFromString(@"_contextId");
+    if (![window respondsToSelector:selector]) selector = NSSelectorFromString(@"_contextID");
+    if (![window respondsToSelector:selector]) return 0;
+    return ((uint32_t (*)(id, SEL))objc_msgSend)(window, selector);
 }
 
 static BOOL sendNormalizedTouch(double x, double y, BDTouchPhase phase) {
@@ -128,15 +137,16 @@ static BOOL sendNormalizedTouch(double x, double y, BDTouchPhase phase) {
     x = MIN(MAX(x, 0.001), 0.999);
     y = MIN(MAX(y, 0.001), 0.999);
     BOOL touching = phase != BDTouchPhaseUp;
-    uint32_t childMask = kBDHIDPosition;
-    if (phase == BDTouchPhaseDown) childMask = kBDHIDTouch | kBDHIDRange;
-    if (phase == BDTouchPhaseUp) childMask = kBDHIDTouch;
+    uint32_t childMask = phase == BDTouchPhaseMove
+        ? kBDHIDPosition
+        : (kBDHIDTouch | kBDHIDRange);
+    uint32_t parentMask = phase == BDTouchPhaseMove ? 0 : kBDHIDTouch;
 
     uint64_t timestamp = mach_absolute_time();
     IOHIDEventRef parent = g_createDigitizer(kCFAllocatorDefault, timestamp,
-        3, 99, 1, 0, 0, 0, 0, 0, 0, 0, false, false, 0);
+        3, 0, 0, parentMask, 0, 0, 0, 0, 0, 0, false, touching, 0);
     IOHIDEventRef finger = g_createFinger(kCFAllocatorDefault, timestamp,
-        1, 3, childMask, x, y, 0, touching ? 1.0 : 0.0, 0,
+        1, 3, childMask, x, y, 0, 0, 0,
         touching, touching, 0);
     if (!parent || !finger) {
         if (parent) CFRelease(parent);
@@ -150,17 +160,31 @@ static BOOL sendNormalizedTouch(double x, double y, BDTouchPhase phase) {
     g_setFloatValue(finger, kBDHIDMajorRadius, 0.04);
     g_setFloatValue(finger, kBDHIDMinorRadius, 0.04);
     g_appendEvent(parent, finger, 0);
-    g_setSenderID(parent, 0x8000000817319371ULL);
 
-    if (g_usingSystemDispatch) {
-        g_dispatchEvent(g_hidClient, parent);
+    __block BOOL delivered = NO;
+    void (^deliverToForegroundWindow)(void) = ^{
+        UIWindow *window = foregroundAppWindow();
+        uint32_t contextID = contextIDForWindow(window);
+        UIApplication *application = [UIApplication sharedApplication];
+        if (window && contextID != 0 &&
+            [application respondsToSelector:@selector(_enqueueHIDEvent:)]) {
+            g_setDigitizerInfo(parent, contextID, false, false, NULL, 0, 0);
+            [application _enqueueHIDEvent:parent];
+            delivered = YES;
+            if (phase == BDTouchPhaseDown) {
+                NSLog(@"[BAutoSwipe] %@ foreground touch contextID=%u", kBAutoSwipeVersion, contextID);
+            }
+        }
+    };
+    if ([NSThread isMainThread]) {
+        deliverToForegroundWindow();
     } else {
-        g_enqueueEvent(parent);
+        dispatch_sync(dispatch_get_main_queue(), deliverToForegroundWindow);
     }
 
     CFRelease(finger);
     CFRelease(parent);
-    return YES;
+    return delivered;
 }
 
 // ===== 滑动手势 =====
@@ -211,9 +235,8 @@ static BOOL performSwipeAuto(BOOL up) {
     if (!hidBackendReady()) return NO;
     BOOL sent = performSwipe(up);
     if (sent) {
-        NSLog(@"[BAutoSwipe] %@ dispatched %@ swipe via %@ backend",
-              kBAutoSwipeVersion, up ? @"up" : @"down",
-              g_usingSystemDispatch ? @"system" : @"enqueue");
+        NSLog(@"[BAutoSwipe] %@ enqueued %@ swipe to foreground window",
+              kBAutoSwipeVersion, up ? @"up" : @"down");
     }
     return sent;
 }
