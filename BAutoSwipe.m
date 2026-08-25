@@ -9,44 +9,35 @@
 #import <UIKit/UIKit.h>
 #import <mach/mach_time.h>
 #import <dlfcn.h>
+#import <math.h>
+#import <unistd.h>
 
-// The iPhoneOS SDK ships IOKit but omits these private HID declarations.
-// Keep the minimal ABI declarations here so GitHub's stock Xcode can compile.
-typedef double IOHIDFloat;
-typedef uint32_t IOHIDEventOptionBits;
-typedef uint32_t IOHIDEventField;
-typedef uint32_t IOHIDDigitizerEventMask;
-typedef uint32_t IOHIDDigitizerTransducerType;
-typedef struct __IOHIDEvent *IOHIDEventRef;
+// iPhoneOS SDK 不公开这些 HID 声明，运行时从 IOKit 动态解析，兼容 iOS 15.0-16.5。
+typedef CFTypeRef IOHIDEventRef;
+typedef CFTypeRef IOHIDEventSystemClientRef;
+typedef IOHIDEventSystemClientRef (*HIDClientCreateFn)(CFAllocatorRef allocator);
+typedef void (*HIDDispatchEventFn)(IOHIDEventSystemClientRef client, IOHIDEventRef event);
+typedef void (*HIDAppendEventFn)(IOHIDEventRef parent, IOHIDEventRef child, uint32_t options);
+typedef void (*HIDSetIntegerValueFn)(IOHIDEventRef event, uint32_t field, CFIndex value);
+typedef void (*HIDSetFloatValueFn)(IOHIDEventRef event, uint32_t field, double value);
+typedef void (*HIDSetSenderIDFn)(IOHIDEventRef event, uint64_t senderID);
+typedef IOHIDEventRef (*HIDCreateDigitizerFn)(CFAllocatorRef, uint64_t, uint32_t,
+    uint32_t, uint32_t, uint32_t, uint32_t, double, double, double, double,
+    double, bool, bool, uint32_t);
+typedef IOHIDEventRef (*HIDCreateFingerFn)(CFAllocatorRef, uint64_t, uint32_t,
+    uint32_t, uint32_t, double, double, double, double, double, bool, bool,
+    uint32_t);
+typedef void (*UIEnqueueHIDEventFn)(IOHIDEventRef event);
 
 enum {
-    kIOHIDEventOptionNone = 0,
-    kIOHIDDigitizerEventRange = 1 << 0,
-    kIOHIDDigitizerEventTouch = 1 << 1,
-    kIOHIDDigitizerEventPosition = 1 << 2,
-    kIOHIDDigitizerEventCancel = 1 << 7,
-    kIOHIDDigitizerTransducerTypeHand = 3,
-    kIOHIDEventFieldDigitizerEventMask = (11 << 16) + 7,
+    kBDHIDRange = 1u << 0,
+    kBDHIDTouch = 1u << 1,
+    kBDHIDPosition = 1u << 2,
+    kBDHIDBuiltIn = 0x4,
+    kBDHIDMajorRadius = 0xB0014,
+    kBDHIDMinorRadius = 0xB0015,
+    kBDHIDDisplayIntegrated = 0xB0019,
 };
-
-extern IOHIDEventRef IOHIDEventCreateDigitizerEvent(
-    CFAllocatorRef allocator, uint64_t timestamp,
-    IOHIDDigitizerTransducerType type, uint32_t index, uint32_t identity,
-    IOHIDDigitizerEventMask eventMask, uint32_t buttonMask,
-    IOHIDFloat x, IOHIDFloat y, IOHIDFloat z, IOHIDFloat pressure,
-    IOHIDFloat twist, boolean_t range, boolean_t touch,
-    IOHIDEventOptionBits options);
-extern IOHIDEventRef IOHIDEventCreateDigitizerFingerEvent(
-    CFAllocatorRef allocator, uint64_t timestamp, uint32_t index,
-    uint32_t identity, IOHIDDigitizerEventMask eventMask,
-    IOHIDFloat x, IOHIDFloat y, IOHIDFloat z, IOHIDFloat pressure,
-    IOHIDFloat twist, boolean_t range, boolean_t touch,
-    IOHIDEventOptionBits options);
-extern void IOHIDEventSetIntegerValue(IOHIDEventRef event,
-                                       IOHIDEventField field, CFIndex value);
-extern void IOHIDEventAppendEvent(IOHIDEventRef parent,
-                                  IOHIDEventRef child,
-                                  IOHIDEventOptionBits options);
 
 // ===== 配置 =====
 static const NSInteger kMaxSwipes = 500;        // 最多滑动次数
@@ -82,91 +73,103 @@ static NSInteger g_swipeCount = 0;
 static NSInteger g_nextRest = 20;
 static UIButton *g_floatingBtn = nil;
 static dispatch_queue_t g_swipeQueue = nil;
+static NSUInteger g_buttonAttachGeneration = 0;
+static id g_didBecomeActiveObserver = nil;
+static id g_windowDidBecomeVisibleObserver = nil;
 
-// _UIEnqueueHIDEvent：UIKit 内部函数，将 HID 事件送入系统事件队列
-typedef void (*UIEnqueueHIDEventFunc)(IOHIDEventRef);
-static UIEnqueueHIDEventFunc g_enqueueFunc = NULL;
+static NSString *const kBAutoSwipeVersion = @"1.0.1";
+static const CGFloat kFloatingButtonSize = 56.0;
+static const CGFloat kFloatingButtonMargin = 12.0;
+static const NSInteger kWindowAttachRetryCount = 60;
+static const NSTimeInterval kWindowAttachRetryDelay = 0.5;
 
-static UIEnqueueHIDEventFunc getEnqueueFunc(void) {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        g_enqueueFunc = (UIEnqueueHIDEventFunc)dlsym(RTLD_DEFAULT, "_UIEnqueueHIDEvent");
-    });
-    return g_enqueueFunc;
-}
+static void *g_iokitHandle = NULL;
+static IOHIDEventSystemClientRef g_hidClient = NULL;
+static HIDClientCreateFn g_createClient = NULL;
+static HIDDispatchEventFn g_dispatchEvent = NULL;
+static HIDAppendEventFn g_appendEvent = NULL;
+static HIDSetIntegerValueFn g_setIntegerValue = NULL;
+static HIDSetFloatValueFn g_setFloatValue = NULL;
+static HIDSetSenderIDFn g_setSenderID = NULL;
+static HIDCreateDigitizerFn g_createDigitizer = NULL;
+static HIDCreateFingerFn g_createFinger = NULL;
+static UIEnqueueHIDEventFn g_enqueueEvent = NULL;
 
 // ===== IOHIDEvent 触摸模拟 =====
 
-static uint64_t nowMachTime(void) {
-    return mach_absolute_time();
+typedef NS_ENUM(NSInteger, BDTouchPhase) {
+    BDTouchPhaseDown,
+    BDTouchPhaseMove,
+    BDTouchPhaseUp,
+};
+
+static BOOL hidBackendReady(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        g_iokitHandle = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL);
+        if (!g_iokitHandle) return;
+
+        g_createClient = (HIDClientCreateFn)dlsym(g_iokitHandle, "IOHIDEventSystemClientCreate");
+        g_dispatchEvent = (HIDDispatchEventFn)dlsym(g_iokitHandle, "IOHIDEventSystemClientDispatchEvent");
+        g_appendEvent = (HIDAppendEventFn)dlsym(g_iokitHandle, "IOHIDEventAppendEvent");
+        g_setIntegerValue = (HIDSetIntegerValueFn)dlsym(g_iokitHandle, "IOHIDEventSetIntegerValue");
+        g_setFloatValue = (HIDSetFloatValueFn)dlsym(g_iokitHandle, "IOHIDEventSetFloatValue");
+        g_setSenderID = (HIDSetSenderIDFn)dlsym(g_iokitHandle, "IOHIDEventSetSenderID");
+        g_createDigitizer = (HIDCreateDigitizerFn)dlsym(g_iokitHandle, "IOHIDEventCreateDigitizerEvent");
+        g_createFinger = (HIDCreateFingerFn)dlsym(g_iokitHandle, "IOHIDEventCreateDigitizerFingerEvent");
+        g_enqueueEvent = (UIEnqueueHIDEventFn)dlsym(RTLD_DEFAULT, "_UIEnqueueHIDEvent");
+        if (g_createClient) g_hidClient = g_createClient(kCFAllocatorDefault);
+
+        NSLog(@"[BAutoSwipe] %@ HID backend enqueue=%d system=%d",
+              kBAutoSwipeVersion, g_enqueueEvent != NULL,
+              g_hidClient != NULL && g_dispatchEvent != NULL);
+    });
+
+    BOOL canCreate = g_appendEvent && g_setIntegerValue && g_setFloatValue &&
+                     g_setSenderID && g_createDigitizer && g_createFinger;
+    BOOL canDispatch = g_enqueueEvent || (g_hidClient && g_dispatchEvent);
+    return canCreate && canDispatch;
 }
 
-static IOHIDEventRef createDigitizerEvent(uint64_t timestamp,
-                                           IOHIDDigitizerEventMask eventMask,
-                                           BOOL isTouching) {
-    return IOHIDEventCreateDigitizerEvent(
-        kCFAllocatorDefault, timestamp,
-        kIOHIDDigitizerTransducerTypeHand,
-        0,  // index
-        0,  // identity
-        eventMask,
-        0,  // button mask
-        0, 0, 0, 0, 0,
-        isTouching, isTouching,
-        kIOHIDEventOptionNone
-    );
-}
+static BOOL sendNormalizedTouch(double x, double y, BDTouchPhase phase) {
+    if (!hidBackendReady() || !isfinite(x) || !isfinite(y)) return NO;
 
-static IOHIDEventRef createFingerEvent(uint64_t timestamp, int fingerId,
-                                       IOHIDDigitizerEventMask eventMask,
-                                       BOOL isTouching,
-                                       CGFloat x, CGFloat y, CGFloat pressure) {
-    return IOHIDEventCreateDigitizerFingerEvent(
-        kCFAllocatorDefault, timestamp,
-        fingerId, fingerId, eventMask,
-        x, y, 0.0, pressure,
-        0.0, isTouching, isTouching,
-        kIOHIDEventOptionNone
-    );
-}
+    x = MIN(MAX(x, 0.001), 0.999);
+    y = MIN(MAX(y, 0.001), 0.999);
+    BOOL touching = phase != BDTouchPhaseUp;
+    uint32_t childMask = kBDHIDPosition;
+    if (phase == BDTouchPhaseDown) childMask = kBDHIDTouch | kBDHIDRange;
+    if (phase == BDTouchPhaseUp) childMask = kBDHIDTouch;
 
-static void sendTouchEvent(int fingerId, UITouchPhase phase, CGFloat x, CGFloat y, CGFloat pressure) {
-    UIEnqueueHIDEventFunc enqueue = getEnqueueFunc();
-    if (!enqueue) return;
+    uint64_t timestamp = mach_absolute_time();
+    IOHIDEventRef parent = g_createDigitizer(kCFAllocatorDefault, timestamp,
+        3, 99, 1, 0, 0, 0, 0, 0, 0, 0, false, false, 0);
+    IOHIDEventRef finger = g_createFinger(kCFAllocatorDefault, timestamp,
+        1, 3, childMask, x, y, 0, touching ? 1.0 : 0.0, 0,
+        touching, touching, 0);
+    if (!parent || !finger) {
+        if (parent) CFRelease(parent);
+        if (finger) CFRelease(finger);
+        return NO;
+    }
 
-    uint64_t ts = nowMachTime();
-    BOOL isTouching = !(phase == UITouchPhaseEnded || phase == UITouchPhaseCancelled);
-    IOHIDDigitizerEventMask options = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch;
-    if (phase == UITouchPhaseMoved) options = kIOHIDDigitizerEventPosition;
-    if (phase == UITouchPhaseCancelled) options |= kIOHIDDigitizerEventCancel;
+    g_setIntegerValue(parent, kBDHIDBuiltIn, 1);
+    g_setIntegerValue(parent, kBDHIDDisplayIntegrated, 1);
+    g_setIntegerValue(finger, kBDHIDDisplayIntegrated, 1);
+    g_setFloatValue(finger, kBDHIDMajorRadius, 0.04);
+    g_setFloatValue(finger, kBDHIDMinorRadius, 0.04);
+    g_appendEvent(parent, finger, 0);
+    g_setSenderID(parent, 0x8000000817319371ULL);
 
-    IOHIDEventRef digitizer = createDigitizerEvent(ts, options, isTouching);
+    if (g_enqueueEvent) {
+        g_enqueueEvent(parent);
+    } else {
+        g_dispatchEvent(g_hidClient, parent);
+    }
 
-    IOHIDEventSetIntegerValue(digitizer, kIOHIDEventFieldDigitizerEventMask, options);
-
-    IOHIDEventRef finger = createFingerEvent(ts, fingerId, options, isTouching, x, y, pressure);
-    IOHIDEventAppendEvent(digitizer, finger, kIOHIDEventOptionNone);
     CFRelease(finger);
-
-    enqueue(digitizer);
-    CFRelease(digitizer);
-}
-
-// 发送移动事件（不需要重新创建完整 digitizer）
-static void sendMoveEvent(int fingerId, CGFloat x, CGFloat y) {
-    UIEnqueueHIDEventFunc enqueue = getEnqueueFunc();
-    if (!enqueue) return;
-
-    uint64_t ts = nowMachTime();
-    IOHIDDigitizerEventMask options = kIOHIDDigitizerEventPosition;
-    IOHIDEventRef digitizer = createDigitizerEvent(ts, options, YES);
-    IOHIDEventSetIntegerValue(digitizer, kIOHIDEventFieldDigitizerEventMask, options);
-    IOHIDEventRef finger = createFingerEvent(ts, fingerId, options, YES, x, y, 0.03);
-    IOHIDEventAppendEvent(digitizer, finger, kIOHIDEventOptionNone);
-    CFRelease(finger);
-
-    enqueue(digitizer);
-    CFRelease(digitizer);
+    CFRelease(parent);
+    return YES;
 }
 
 // ===== 滑动手势 =====
@@ -179,49 +182,37 @@ static NSInteger randInt(NSInteger min, NSInteger max) {
     return min + arc4random_uniform((uint32_t)(max - min + 1));
 }
 
-// 用 IOHIDEvent 模拟一次滑动
-static void performSwipe(BOOL up) {
-    CGFloat screenW = [UIScreen mainScreen].bounds.size.width;
-    CGFloat screenH = [UIScreen mainScreen].bounds.size.height;
-
-    CGFloat startX, startY, endX, endY;
-
-    if (up) {
-        startX = randFloat(screenW * 0.30, screenW * 0.70);
-        startY = randFloat(screenH * 0.65, screenH * 0.80);
-        endY = startY - randFloat(280, 450);
-        endX = startX + randFloat(-25, 25);
-    } else {
-        startX = randFloat(screenW * 0.35, screenW * 0.65);
-        startY = randFloat(screenH * 0.30, screenH * 0.45);
-        endY = startY + randFloat(200, 350);
-        endX = startX + randFloat(-20, 20);
-    }
-
+// HID 坐标必须是 0.0-1.0；不能直接传 SE2 的 375x667 屏幕点。
+static BOOL performSwipe(BOOL up) {
+    double startX = randFloat(0.45, 0.55);
+    double endX = startX + randFloat(-0.025, 0.025);
+    double startY = up ? randFloat(0.80, 0.87) : randFloat(0.24, 0.31);
+    double endY = up ? randFloat(0.20, 0.28) : randFloat(0.70, 0.79);
+    double controlOffset = randFloat(-0.018, 0.018);
     NSTimeInterval duration = randFloat(kMinSwipe, kMaxSwipe);
-    int steps = (int)(duration / 0.016);  // ~60fps
-    int fingerId = 0;
+    NSInteger steps = MAX(18, (NSInteger)llround(duration / 0.016));
 
-    // 按下
-    sendTouchEvent(fingerId, UITouchPhaseBegan, startX, startY, 0.02);
-    usleep(randInt(30000, 80000));  // 按下后停留 30-80ms
+    BOOL started = sendNormalizedTouch(startX, startY, BDTouchPhaseDown);
+    if (!started) return NO;
+    usleep((useconds_t)randInt(30000, 65000));
 
-    // 滑动（easeOutCubic：先快后慢）
-    for (int i = 1; i <= steps; i++) {
-        double t = (double)i / steps;
-        double ease = 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t);
-        CGFloat x = startX + (endX - startX) * ease;
-        CGFloat y = startY + (endY - startY) * ease;
-        sendMoveEvent(fingerId, x, y);
-        usleep(16000);
+    BOOL moved = YES;
+    for (NSInteger i = 1; i <= steps; i++) {
+        double t = (double)i / (double)steps;
+        double eased = t * t * (3.0 - 2.0 * t);
+        double curve = 4.0 * t * (1.0 - t) * controlOffset;
+        double x = startX + (endX - startX) * eased + curve;
+        double y = startY + (endY - startY) * eased;
+        if (!sendNormalizedTouch(x, y, BDTouchPhaseMove)) {
+            moved = NO;
+            break;
+        }
+        usleep((useconds_t)((duration / (double)steps) * 1000000.0));
     }
 
-    // 确保到达终点
-    sendMoveEvent(fingerId, endX, endY);
-    usleep(randInt(20000, 60000));
-
-    // 抬手
-    sendTouchEvent(fingerId, UITouchPhaseEnded, endX, endY, 0.0);
+    usleep((useconds_t)randInt(12000, 28000));
+    BOOL lifted = sendNormalizedTouch(endX, endY, BDTouchPhaseUp);
+    return moved && lifted;
 }
 
 // 回退方案：直接滚动 UIScrollView（如果 HID 事件不可用）
@@ -263,9 +254,7 @@ static void performSwipeFallback(BOOL up) {
 }
 
 static void performSwipeAuto(BOOL up) {
-    if (getEnqueueFunc()) {
-        performSwipe(up);
-    } else {
+    if (!hidBackendReady() || !performSwipe(up)) {
         // HID 不可用，回退到主线程执行 setContentOffset
         dispatch_async(dispatch_get_main_queue(), ^{
             performSwipeFallback(up);
@@ -332,7 +321,9 @@ static void swipeLoop(void) {
     });
 }
 
-// ===== 悬浮按钮 =====
+// ===== 悬浮按钮（独立 UIWindow，保证不被遮挡）=====
+
+static UIWindow *g_floatWindow = nil;
 
 static void toggleRunning(void) {
     g_running = !g_running;
@@ -350,55 +341,113 @@ static void toggleRunning(void) {
     }
 }
 
-static void addFloatingButton(void) {
-    if (g_floatingBtn) return;
+static UIWindowScene *foregroundWindowScene(void) {
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (scene.activationState == UISceneActivationStateForegroundActive &&
+            [scene isKindOfClass:[UIWindowScene class]]) {
+            return (UIWindowScene *)scene;
+        }
+    }
+    return nil;
+}
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        CGFloat btnSize = 60;
-        CGFloat screenW = [UIScreen mainScreen].bounds.size.width;
-        CGFloat screenH = [UIScreen mainScreen].bounds.size.height;
+static CGRect leftMiddleWindowFrame(UIWindowScene *scene) {
+    CGRect screenBounds = scene.coordinateSpace.bounds;
+    CGFloat x = CGRectGetMinX(screenBounds) + kFloatingButtonMargin;
+    CGFloat y = CGRectGetMidY(screenBounds) - kFloatingButtonSize / 2.0;
+    return CGRectMake(x, y, kFloatingButtonSize, kFloatingButtonSize);
+}
 
-        UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
-        btn.frame = CGRectMake(screenW - btnSize - 15, screenH * 0.4, btnSize, btnSize);
-        btn.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:0.2 alpha:0.85];
-        [btn setTitle:@"开始" forState:UIControlStateNormal];
-        btn.titleLabel.font = [UIFont systemFontOfSize:14];
-        btn.layer.cornerRadius = btnSize / 2;
-        btn.layer.masksToBounds = YES;
-        btn.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
+static void attachFloatingButton(NSUInteger generation, NSInteger retriesRemaining) {
+    if (generation != g_buttonAttachGeneration) return;
 
-        // 点击开始/停止
-        [btn addAction:[UIAction actionWithHandler:^(__kindof UIAction *action) {
+    UIWindowScene *activeScene = foregroundWindowScene();
+    if (!activeScene) {
+        if (retriesRemaining > 0) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(kWindowAttachRetryDelay * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                attachFloatingButton(generation, retriesRemaining - 1);
+            });
+        } else {
+            NSLog(@"[BAutoSwipe] %@ could not find an active window scene", kBAutoSwipeVersion);
+        }
+        return;
+    }
+
+    if (g_floatWindow && g_floatWindow.windowScene != activeScene) {
+        g_floatWindow.hidden = YES;
+        g_floatWindow = nil;
+        g_floatingBtn = nil;
+    }
+
+    if (!g_floatWindow) {
+        UIWindow *window = [[UIWindow alloc] initWithWindowScene:activeScene];
+        window.frame = leftMiddleWindowFrame(activeScene);
+        window.windowLevel = UIWindowLevelAlert + 100;
+        window.backgroundColor = [UIColor clearColor];
+        window.rootViewController = [[UIViewController alloc] init];
+        window.rootViewController.view.backgroundColor = [UIColor clearColor];
+        window.userInteractionEnabled = YES;
+
+        UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
+        button.frame = window.bounds;
+        button.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:0.2 alpha:0.88];
+        [button setTitle:@"开始" forState:UIControlStateNormal];
+        button.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+        button.layer.cornerRadius = kFloatingButtonSize / 2.0;
+        button.layer.masksToBounds = YES;
+        button.accessibilityLabel = @"百度自动滑屏开始按钮";
+
+        [button addAction:[UIAction actionWithHandler:^(__unused UIAction *action) {
             toggleRunning();
         }] forControlEvents:UIControlEventTouchUpInside];
 
-        // 拖动按钮位置
-        UIPanGestureRecognizer *drag = [[UIPanGestureRecognizer alloc] initWithTarget:btn action:@selector(bdas_handlePan:)];
-        [btn addGestureRecognizer:drag];
+        UIPanGestureRecognizer *drag = [[UIPanGestureRecognizer alloc] initWithTarget:button
+                                                                               action:@selector(bdas_handlePan:)];
+        [button addGestureRecognizer:drag];
+        [window.rootViewController.view addSubview:button];
 
-        UIWindow *keyWindow = nil;
-        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-            if (scene.activationState == UISceneActivationStateForegroundActive) {
-                for (UIWindow *w in ((UIWindowScene *)scene).windows) {
-                    if (w.isKeyWindow) { keyWindow = w; break; }
-                }
-            }
-        }
-        if (keyWindow) {
-            [keyWindow addSubview:btn];
-        }
-        g_floatingBtn = btn;
+        g_floatWindow = window;
+        g_floatingBtn = button;
+    }
+
+    g_floatWindow.windowLevel = UIWindowLevelAlert + 100;
+    g_floatWindow.hidden = NO;
+    NSLog(@"[BAutoSwipe] %@ left button visible frame=%@",
+          kBAutoSwipeVersion, NSStringFromCGRect(g_floatWindow.frame));
+}
+
+static void scheduleButtonAttachment(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSUInteger generation = ++g_buttonAttachGeneration;
+        attachFloatingButton(generation, kWindowAttachRetryCount);
     });
 }
 
-// 用 category 实现拖动
+// 用 category 实现拖动（移动整个 UIWindow）
 @interface UIButton (BDAutoSwipe)
 @end
 
 @implementation UIButton (BDAutoSwipe)
 - (void)bdas_handlePan:(UIPanGestureRecognizer *)pan {
     CGPoint translation = [pan translationInView:self.superview];
-    self.center = CGPointMake(self.center.x + translation.x, self.center.y + translation.y);
+    UIWindow *win = self.window;
+    if (win) {
+        CGPoint c = win.center;
+        c.x += translation.x;
+        c.y += translation.y;
+        CGRect screenBounds = win.windowScene.coordinateSpace.bounds;
+        CGFloat halfW = win.bounds.size.width / 2;
+        CGFloat halfH = win.bounds.size.height / 2;
+        CGFloat minX = CGRectGetMinX(screenBounds) + halfW + kFloatingButtonMargin;
+        CGFloat maxX = CGRectGetMaxX(screenBounds) - halfW - kFloatingButtonMargin;
+        CGFloat minY = CGRectGetMinY(screenBounds) + halfH + kFloatingButtonMargin;
+        CGFloat maxY = CGRectGetMaxY(screenBounds) - halfH - kFloatingButtonMargin;
+        c.x = MIN(MAX(c.x, minX), maxX);
+        c.y = MIN(MAX(c.y, minY), maxY);
+        win.center = c;
+    }
     [pan setTranslation:CGPointZero inView:self.superview];
 }
 @end
@@ -407,15 +456,28 @@ static void addFloatingButton(void) {
 
 __attribute__((constructor))
 static void bdas_init(void) {
-    // 只在百度极速版中加载
     NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
-    if (![bundleID containsString:@"baidu"]) return;
+    if (!bundleID || [[bundleID lowercaseString] rangeOfString:@"baidu"].location == NSNotFound) return;
 
     g_swipeQueue = dispatch_queue_create("com.bdas.autoswipe", DISPATCH_QUEUE_SERIAL);
+    NSLog(@"[BAutoSwipe] %@ loaded in %@", kBAutoSwipeVersion, bundleID);
 
-    // 延迟 2 秒添加按钮，等 App 启动完成
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        addFloatingButton();
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+        g_didBecomeActiveObserver = [center addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                       object:nil
+                                                        queue:[NSOperationQueue mainQueue]
+                                                   usingBlock:^(__unused NSNotification *notification) {
+            scheduleButtonAttachment();
+        }];
+        g_windowDidBecomeVisibleObserver = [center addObserverForName:UIWindowDidBecomeVisibleNotification
+                                                               object:nil
+                                                                queue:[NSOperationQueue mainQueue]
+                                                           usingBlock:^(NSNotification *notification) {
+            if (notification.object != g_floatWindow) scheduleButtonAttachment();
+        }];
+
+        hidBackendReady();
+        scheduleButtonAttachment();
     });
 }
