@@ -49,22 +49,9 @@ static const NSInteger kRestMaxSwipes = 30;     // 最多多少个视频后休�
 static const NSTimeInterval kRestMin = 60.0;    // 最短休息时间
 static const NSTimeInterval kRestMax = 180.0;   // 最长休息时间
 
-// 观看时间分布（模拟真人）
-// 20% 不感兴趣快速划走：8-25 秒
-// 55% 正常观看：30-120 秒
-// 20% 比较感兴趣：120-240 秒
-// 5%  看完/很感兴趣：240-420 秒
+// 触控测试阶段：所有视频只等待 8-30 秒；真机滑动稳定后再恢复正式分布。
 static NSTimeInterval randomWatchTime(void) {
-    uint32_t r = arc4random_uniform(100);
-    if (r < 20) {
-        return 8 + (arc4random_uniform(1700) / 100.0);        // 8-25s
-    } else if (r < 75) {
-        return 30 + (arc4random_uniform(9000) / 100.0);       // 30-120s
-    } else if (r < 95) {
-        return 120 + (arc4random_uniform(12000) / 100.0);     // 120-240s
-    } else {
-        return 180 + (arc4random_uniform(12000) / 100.0);     // 180-300s（3-5分钟）
-    }
+    return 8.0 + (arc4random_uniform(2201) / 100.0);
 }
 
 // ===== 全局状态 =====
@@ -78,7 +65,7 @@ static NSUInteger g_buttonAttachGeneration = 0;
 static id g_didBecomeActiveObserver = nil;
 static id g_windowDidBecomeVisibleObserver = nil;
 
-static NSString *const kBAutoSwipeVersion = @"1.0.2";
+static NSString *const kBAutoSwipeVersion = @"1.0.3-touchtest";
 static const CGFloat kFloatingButtonSize = 60.0;
 static const CGFloat kFloatingButtonMargin = 12.0;
 static const NSInteger kWindowAttachRetryCount = 60;
@@ -95,6 +82,7 @@ static HIDSetSenderIDFn g_setSenderID = NULL;
 static HIDCreateDigitizerFn g_createDigitizer = NULL;
 static HIDCreateFingerFn g_createFinger = NULL;
 static UIEnqueueHIDEventFn g_enqueueEvent = NULL;
+static BOOL g_usingSystemDispatch = NO;
 
 // ===== IOHIDEvent 触摸模拟 =====
 
@@ -120,9 +108,11 @@ static BOOL hidBackendReady(void) {
         g_createFinger = (HIDCreateFingerFn)dlsym(g_iokitHandle, "IOHIDEventCreateDigitizerFingerEvent");
         g_enqueueEvent = (UIEnqueueHIDEventFn)dlsym(RTLD_DEFAULT, "_UIEnqueueHIDEvent");
         if (g_createClient) g_hidClient = g_createClient(kCFAllocatorDefault);
+        g_usingSystemDispatch = g_hidClient != NULL && g_dispatchEvent != NULL;
 
-        NSLog(@"[BAutoSwipe] %@ HID backend enqueue=%d system=%d",
-              kBAutoSwipeVersion, g_enqueueEvent != NULL,
+        NSLog(@"[BAutoSwipe] %@ HID backend selected=%@ enqueue=%d system=%d",
+              kBAutoSwipeVersion, g_usingSystemDispatch ? @"system" : @"enqueue",
+              g_enqueueEvent != NULL,
               g_hidClient != NULL && g_dispatchEvent != NULL);
     });
 
@@ -162,10 +152,10 @@ static BOOL sendNormalizedTouch(double x, double y, BDTouchPhase phase) {
     g_appendEvent(parent, finger, 0);
     g_setSenderID(parent, 0x8000000817319371ULL);
 
-    if (g_enqueueEvent) {
-        g_enqueueEvent(parent);
-    } else {
+    if (g_usingSystemDispatch) {
         g_dispatchEvent(g_hidClient, parent);
+    } else {
+        g_enqueueEvent(parent);
     }
 
     CFRelease(finger);
@@ -216,52 +206,16 @@ static BOOL performSwipe(BOOL up) {
     return moved && lifted;
 }
 
-// 回退方案：直接滚动 UIScrollView（如果 HID 事件不可用）
-static void performSwipeFallback(BOOL up) {
-    UIWindow *keyWindow = nil;
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if (scene.activationState == UISceneActivationStateForegroundActive) {
-            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
-                if (w.isKeyWindow) { keyWindow = w; break; }
-            }
-        }
+// 测试版只允许真实 HID 触控；不使用 setContentOffset 伪造页面滚动。
+static BOOL performSwipeAuto(BOOL up) {
+    if (!hidBackendReady()) return NO;
+    BOOL sent = performSwipe(up);
+    if (sent) {
+        NSLog(@"[BAutoSwipe] %@ dispatched %@ swipe via %@ backend",
+              kBAutoSwipeVersion, up ? @"up" : @"down",
+              g_usingSystemDispatch ? @"system" : @"enqueue");
     }
-    if (!keyWindow) return;
-
-    // 找到当前可见的 UIScrollView
-    UIScrollView *targetSV = nil;
-    NSMutableArray *stack = [NSMutableArray arrayWithObject:keyWindow];
-    while (stack.count > 0 && !targetSV) {
-        UIView *v = stack.lastObject;
-        [stack removeLastObject];
-        if ([v isKindOfClass:[UIScrollView class]]) {
-            UIScrollView *sv = (UIScrollView *)v;
-            if (sv.contentSize.height > sv.bounds.size.height &&
-                sv.bounds.size.width > 100 && sv.bounds.size.height > 200 &&
-                !sv.dragging && !sv.decelerating) {
-                targetSV = sv;
-            }
-        }
-        for (UIView *sub in v.subviews) [stack addObject:sub];
-    }
-
-    if (targetSV) {
-        CGFloat pageH = targetSV.bounds.size.height;
-        CGPoint offset = targetSV.contentOffset;
-        offset.y += up ? pageH : -pageH;
-        offset.y = MAX(0, MIN(offset.y, targetSV.contentSize.height - pageH));
-        [targetSV setContentOffset:offset animated:YES];
-    }
-}
-
-static void performSwipeAuto(BOOL up) {
-    if (!hidBackendReady() || !performSwipe(up)) {
-        // HID 不可用，回退到主线程执行 setContentOffset
-        dispatch_async(dispatch_get_main_queue(), ^{
-            performSwipeFallback(up);
-        });
-        usleep(300000);
-    }
+    return sent;
 }
 
 // ===== 主循环 =====
@@ -271,6 +225,7 @@ static BOOL swipeRunIsActive(NSUInteger generation) {
 }
 
 static void swipeLoop(NSUInteger generation) {
+    BOOL hidFailed = NO;
     while (swipeRunIsActive(generation) && g_swipeCount < kMaxSwipes) {
         @autoreleasepool {
             // 观看视频（随机时长，分段 sleep 以便及时响应停止）
@@ -286,12 +241,15 @@ static void swipeLoop(NSUInteger generation) {
 
             // 8% 概率下滑回看
             BOOL goBack = (arc4random_uniform(100) < (uint32_t)(kSwipeDownProbability * 100));
-            performSwipeAuto(!goBack);
+            if (!performSwipeAuto(!goBack)) {
+                hidFailed = YES;
+                break;
+            }
             g_swipeCount++;
 
             // 更新按钮标题
             dispatch_async(dispatch_get_main_queue(), ^{
-                [g_floatingBtn setTitle:[NSString stringWithFormat:@"滑%ld次\n停止", (long)g_swipeCount]
+                [g_floatingBtn setTitle:[NSString stringWithFormat:@"发%ld次\n停止", (long)g_swipeCount]
                                forState:UIControlStateNormal];
             });
 
@@ -299,8 +257,15 @@ static void swipeLoop(NSUInteger generation) {
                 // 回看后看几秒再滑回来
                 usleep(randInt(3, 10) * 1000000);
                 if (!swipeRunIsActive(generation)) break;
-                performSwipeAuto(YES);
+                if (!performSwipeAuto(YES)) {
+                    hidFailed = YES;
+                    break;
+                }
                 g_swipeCount++;
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [g_floatingBtn setTitle:[NSString stringWithFormat:@"发%ld次\n停止", (long)g_swipeCount]
+                                   forState:UIControlStateNormal];
+                });
             }
 
             // 定期长休息
@@ -322,8 +287,13 @@ static void swipeLoop(NSUInteger generation) {
     if (generation == g_runGeneration) {
         g_running = NO;
         dispatch_async(dispatch_get_main_queue(), ^{
-            [g_floatingBtn setTitle:@"开始" forState:UIControlStateNormal];
-            g_floatingBtn.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:0.2 alpha:0.85];
+            if (hidFailed) {
+                [g_floatingBtn setTitle:@"HID失败\n点重试" forState:UIControlStateNormal];
+                g_floatingBtn.backgroundColor = [UIColor colorWithRed:0.85 green:0.45 blue:0.05 alpha:0.9];
+            } else {
+                [g_floatingBtn setTitle:@"开始" forState:UIControlStateNormal];
+                g_floatingBtn.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:0.2 alpha:0.85];
+            }
         });
     }
 }
