@@ -46,12 +46,12 @@ jobs:
 
       - name: Create fat binary
         run: |
-          xcrun lipo -create BAutoSwipe_arm64.dylib BAutoSwipe_arm64e.dylib -output BAutoSwipe_1.0.1.dylib
-          xcrun lipo -info BAutoSwipe_1.0.1.dylib
-          codesign --force --sign - BAutoSwipe_1.0.1.dylib
+          xcrun lipo -create BAutoSwipe_arm64.dylib BAutoSwipe_arm64e.dylib -output BAutoSwipe_1.0.2.dylib
+          xcrun lipo -info BAutoSwipe_1.0.2.dylib
+          codesign --force --sign - BAutoSwipe_1.0.2.dylib
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: BAutoSwipe_1.0.1
-          path: BAutoSwipe_1.0.1.dylib
+          name: BAutoSwipe_1.0.2
+          path: BAutoSwipe_1.0.2.dylib

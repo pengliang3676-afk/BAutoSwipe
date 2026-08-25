@@ -69,6 +69,7 @@ static NSTimeInterval randomWatchTime(void) {
 
 // ===== 全局状态 =====
 static BOOL g_running = NO;
+static NSUInteger g_runGeneration = 0;
 static NSInteger g_swipeCount = 0;
 static NSInteger g_nextRest = 20;
 static UIButton *g_floatingBtn = nil;
@@ -77,8 +78,8 @@ static NSUInteger g_buttonAttachGeneration = 0;
 static id g_didBecomeActiveObserver = nil;
 static id g_windowDidBecomeVisibleObserver = nil;
 
-static NSString *const kBAutoSwipeVersion = @"1.0.1";
-static const CGFloat kFloatingButtonSize = 56.0;
+static NSString *const kBAutoSwipeVersion = @"1.0.2";
+static const CGFloat kFloatingButtonSize = 60.0;
 static const CGFloat kFloatingButtonMargin = 12.0;
 static const NSInteger kWindowAttachRetryCount = 60;
 static const NSTimeInterval kWindowAttachRetryDelay = 0.5;
@@ -265,19 +266,23 @@ static void performSwipeAuto(BOOL up) {
 
 // ===== 主循环 =====
 
-static void swipeLoop(void) {
-    while (g_running && g_swipeCount < kMaxSwipes) {
+static BOOL swipeRunIsActive(NSUInteger generation) {
+    return g_running && generation == g_runGeneration;
+}
+
+static void swipeLoop(NSUInteger generation) {
+    while (swipeRunIsActive(generation) && g_swipeCount < kMaxSwipes) {
         @autoreleasepool {
             // 观看视频（随机时长，分段 sleep 以便及时响应停止）
             NSTimeInterval watchTime = randomWatchTime();
             NSTimeInterval watched = 0;
-            while (watched < watchTime && g_running) {
+            while (watched < watchTime && swipeRunIsActive(generation)) {
                 NSTimeInterval chunk = MIN(randFloat(2, 5), watchTime - watched);
                 usleep((useconds_t)(chunk * 1000000));
                 watched += chunk;
             }
 
-            if (!g_running) break;
+            if (!swipeRunIsActive(generation)) break;
 
             // 8% 概率下滑回看
             BOOL goBack = (arc4random_uniform(100) < (uint32_t)(kSwipeDownProbability * 100));
@@ -286,14 +291,14 @@ static void swipeLoop(void) {
 
             // 更新按钮标题
             dispatch_async(dispatch_get_main_queue(), ^{
-                [g_floatingBtn setTitle:[NSString stringWithFormat:@"滑%ld 停", (long)g_swipeCount]
+                [g_floatingBtn setTitle:[NSString stringWithFormat:@"滑%ld次\n停止", (long)g_swipeCount]
                                forState:UIControlStateNormal];
             });
 
             if (goBack) {
                 // 回看后看几秒再滑回来
                 usleep(randInt(3, 10) * 1000000);
-                if (!g_running) break;
+                if (!swipeRunIsActive(generation)) break;
                 performSwipeAuto(YES);
                 g_swipeCount++;
             }
@@ -302,10 +307,10 @@ static void swipeLoop(void) {
             if (g_swipeCount >= g_nextRest) {
                 NSTimeInterval restTime = randFloat(kRestMin, kRestMax);
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    [g_floatingBtn setTitle:@"休息中" forState:UIControlStateNormal];
+                    [g_floatingBtn setTitle:@"休息中\n停止" forState:UIControlStateNormal];
                 });
                 NSTimeInterval rested = 0;
-                while (rested < restTime && g_running) {
+                while (rested < restTime && swipeRunIsActive(generation)) {
                     usleep(2000000);
                     rested += 2;
                 }
@@ -314,55 +319,104 @@ static void swipeLoop(void) {
         }
     }
 
-    g_running = NO;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [g_floatingBtn setTitle:@"开始" forState:UIControlStateNormal];
-        g_floatingBtn.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:0.2 alpha:0.85];
-    });
+    if (generation == g_runGeneration) {
+        g_running = NO;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [g_floatingBtn setTitle:@"开始" forState:UIControlStateNormal];
+            g_floatingBtn.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:0.2 alpha:0.85];
+        });
+    }
 }
 
-// ===== 悬浮按钮（独立 UIWindow，保证不被遮挡）=====
-
-static UIWindow *g_floatWindow = nil;
+// ===== 悬浮按钮（挂载到 App 主窗口，避免与其他插件的 UIWindow 冲突）=====
 
 static void toggleRunning(void) {
-    g_running = !g_running;
-    if (g_running) {
+    if (!g_running) {
+        g_running = YES;
+        NSUInteger generation = ++g_runGeneration;
         g_swipeCount = 0;
         g_nextRest = randInt(kRestMinSwipes, kRestMaxSwipes);
         g_floatingBtn.backgroundColor = [UIColor colorWithRed:0.8 green:0.2 blue:0.2 alpha:0.85];
-        [g_floatingBtn setTitle:@"运行中" forState:UIControlStateNormal];
+        [g_floatingBtn setTitle:@"等待中\n停止" forState:UIControlStateNormal];
         dispatch_async(g_swipeQueue, ^{
-            swipeLoop();
+            swipeLoop(generation);
         });
     } else {
+        g_running = NO;
+        ++g_runGeneration;
         g_floatingBtn.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:0.2 alpha:0.85];
         [g_floatingBtn setTitle:@"开始" forState:UIControlStateNormal];
     }
 }
 
-static UIWindowScene *foregroundWindowScene(void) {
+static BOOL isFullScreenAppWindow(UIWindow *window, UIWindowScene *scene) {
+    if (!window || window.hidden || window.alpha <= 0.0 || window.windowLevel != UIWindowLevelNormal) return NO;
+    CGRect sceneBounds = scene.coordinateSpace.bounds;
+    CGSize size = window.bounds.size;
+    return size.width >= CGRectGetWidth(sceneBounds) * 0.8 &&
+           size.height >= CGRectGetHeight(sceneBounds) * 0.8;
+}
+
+static UIWindow *foregroundAppWindow(void) {
     for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if (scene.activationState == UISceneActivationStateForegroundActive &&
-            [scene isKindOfClass:[UIWindowScene class]]) {
-            return (UIWindowScene *)scene;
+        if (scene.activationState != UISceneActivationStateForegroundActive ||
+            ![scene isKindOfClass:[UIWindowScene class]]) {
+            continue;
         }
+
+        UIWindowScene *windowScene = (UIWindowScene *)scene;
+        UIWindow *visibleCandidate = nil;
+        for (UIWindow *window in windowScene.windows) {
+            if (!isFullScreenAppWindow(window, windowScene)) continue;
+            if (window.isKeyWindow) return window;
+            if (!visibleCandidate) visibleCandidate = window;
+        }
+        if (visibleCandidate) return visibleCandidate;
     }
     return nil;
 }
 
-static CGRect leftMiddleWindowFrame(UIWindowScene *scene) {
-    CGRect screenBounds = scene.coordinateSpace.bounds;
-    CGFloat x = CGRectGetMinX(screenBounds) + kFloatingButtonMargin;
-    CGFloat y = CGRectGetMidY(screenBounds) - kFloatingButtonSize / 2.0;
+static CGRect leftMiddleButtonFrame(UIWindow *window) {
+    CGRect bounds = window.bounds;
+    UIEdgeInsets safeInsets = window.safeAreaInsets;
+    CGFloat x = CGRectGetMinX(bounds) + safeInsets.left + kFloatingButtonMargin;
+    CGFloat minimumY = CGRectGetMinY(bounds) + safeInsets.top + kFloatingButtonMargin;
+    CGFloat maximumY = CGRectGetMaxY(bounds) - safeInsets.bottom -
+                       kFloatingButtonMargin - kFloatingButtonSize;
+    CGFloat y = CGRectGetMidY(bounds) - kFloatingButtonSize / 2.0;
+    y = MIN(MAX(y, minimumY), maximumY);
     return CGRectMake(x, y, kFloatingButtonSize, kFloatingButtonSize);
+}
+
+static UIButton *createFloatingButton(void) {
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
+    button.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:0.2 alpha:0.88];
+    [button setTitle:@"开始" forState:UIControlStateNormal];
+    button.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+    button.titleLabel.numberOfLines = 2;
+    button.titleLabel.textAlignment = NSTextAlignmentCenter;
+    button.layer.cornerRadius = kFloatingButtonSize / 2.0;
+    button.layer.masksToBounds = YES;
+    button.autoresizingMask = UIViewAutoresizingFlexibleRightMargin |
+                              UIViewAutoresizingFlexibleTopMargin |
+                              UIViewAutoresizingFlexibleBottomMargin;
+    button.accessibilityLabel = @"百度自动滑屏开始按钮";
+
+    [button addAction:[UIAction actionWithHandler:^(__unused UIAction *action) {
+        toggleRunning();
+    }] forControlEvents:UIControlEventTouchUpInside];
+
+    UIPanGestureRecognizer *drag = [[UIPanGestureRecognizer alloc] initWithTarget:button
+                                                                           action:@selector(bdas_handlePan:)];
+    [button addGestureRecognizer:drag];
+    return button;
 }
 
 static void attachFloatingButton(NSUInteger generation, NSInteger retriesRemaining) {
     if (generation != g_buttonAttachGeneration) return;
 
-    UIWindowScene *activeScene = foregroundWindowScene();
-    if (!activeScene) {
+    UIWindow *targetWindow = foregroundAppWindow();
+    if (!targetWindow) {
         if (retriesRemaining > 0) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                          (int64_t)(kWindowAttachRetryDelay * NSEC_PER_SEC)),
@@ -370,52 +424,24 @@ static void attachFloatingButton(NSUInteger generation, NSInteger retriesRemaini
                 attachFloatingButton(generation, retriesRemaining - 1);
             });
         } else {
-            NSLog(@"[BAutoSwipe] %@ could not find an active window scene", kBAutoSwipeVersion);
+            NSLog(@"[BAutoSwipe] %@ could not find the full-screen app window", kBAutoSwipeVersion);
         }
         return;
     }
 
-    if (g_floatWindow && g_floatWindow.windowScene != activeScene) {
-        g_floatWindow.hidden = YES;
-        g_floatWindow = nil;
-        g_floatingBtn = nil;
+    BOOL needsInitialPosition = !g_floatingBtn || g_floatingBtn.superview != targetWindow;
+    if (!g_floatingBtn) g_floatingBtn = createFloatingButton();
+    if (g_floatingBtn.superview != targetWindow) {
+        [g_floatingBtn removeFromSuperview];
+        [targetWindow addSubview:g_floatingBtn];
     }
+    if (needsInitialPosition) g_floatingBtn.frame = leftMiddleButtonFrame(targetWindow);
 
-    if (!g_floatWindow) {
-        UIWindow *window = [[UIWindow alloc] initWithWindowScene:activeScene];
-        window.frame = leftMiddleWindowFrame(activeScene);
-        window.windowLevel = UIWindowLevelAlert + 100;
-        window.backgroundColor = [UIColor clearColor];
-        window.rootViewController = [[UIViewController alloc] init];
-        window.rootViewController.view.backgroundColor = [UIColor clearColor];
-        window.userInteractionEnabled = YES;
-
-        UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
-        button.frame = window.bounds;
-        button.backgroundColor = [UIColor colorWithRed:0.2 green:0.6 blue:0.2 alpha:0.88];
-        [button setTitle:@"开始" forState:UIControlStateNormal];
-        button.titleLabel.font = [UIFont boldSystemFontOfSize:13];
-        button.layer.cornerRadius = kFloatingButtonSize / 2.0;
-        button.layer.masksToBounds = YES;
-        button.accessibilityLabel = @"百度自动滑屏开始按钮";
-
-        [button addAction:[UIAction actionWithHandler:^(__unused UIAction *action) {
-            toggleRunning();
-        }] forControlEvents:UIControlEventTouchUpInside];
-
-        UIPanGestureRecognizer *drag = [[UIPanGestureRecognizer alloc] initWithTarget:button
-                                                                               action:@selector(bdas_handlePan:)];
-        [button addGestureRecognizer:drag];
-        [window.rootViewController.view addSubview:button];
-
-        g_floatWindow = window;
-        g_floatingBtn = button;
-    }
-
-    g_floatWindow.windowLevel = UIWindowLevelAlert + 100;
-    g_floatWindow.hidden = NO;
-    NSLog(@"[BAutoSwipe] %@ left button visible frame=%@",
-          kBAutoSwipeVersion, NSStringFromCGRect(g_floatWindow.frame));
+    g_floatingBtn.hidden = NO;
+    g_floatingBtn.alpha = 1.0;
+    [targetWindow bringSubviewToFront:g_floatingBtn];
+    NSLog(@"[BAutoSwipe] %@ button attached to app window frame=%@",
+          kBAutoSwipeVersion, NSStringFromCGRect(g_floatingBtn.frame));
 }
 
 static void scheduleButtonAttachment(void) {
@@ -425,30 +451,29 @@ static void scheduleButtonAttachment(void) {
     });
 }
 
-// 用 category 实现拖动（移动整个 UIWindow）
+// 用 category 实现拖动，只移动按钮，不创建或移动额外 UIWindow。
 @interface UIButton (BDAutoSwipe)
 @end
 
 @implementation UIButton (BDAutoSwipe)
 - (void)bdas_handlePan:(UIPanGestureRecognizer *)pan {
-    CGPoint translation = [pan translationInView:self.superview];
-    UIWindow *win = self.window;
-    if (win) {
-        CGPoint c = win.center;
-        c.x += translation.x;
-        c.y += translation.y;
-        CGRect screenBounds = win.windowScene.coordinateSpace.bounds;
-        CGFloat halfW = win.bounds.size.width / 2;
-        CGFloat halfH = win.bounds.size.height / 2;
-        CGFloat minX = CGRectGetMinX(screenBounds) + halfW + kFloatingButtonMargin;
-        CGFloat maxX = CGRectGetMaxX(screenBounds) - halfW - kFloatingButtonMargin;
-        CGFloat minY = CGRectGetMinY(screenBounds) + halfH + kFloatingButtonMargin;
-        CGFloat maxY = CGRectGetMaxY(screenBounds) - halfH - kFloatingButtonMargin;
-        c.x = MIN(MAX(c.x, minX), maxX);
-        c.y = MIN(MAX(c.y, minY), maxY);
-        win.center = c;
-    }
-    [pan setTranslation:CGPointZero inView:self.superview];
+    UIView *container = self.superview;
+    if (!container) return;
+
+    CGPoint translation = [pan translationInView:container];
+    CGPoint center = CGPointMake(self.center.x + translation.x, self.center.y + translation.y);
+    CGRect bounds = container.bounds;
+    UIEdgeInsets safeInsets = container.safeAreaInsets;
+    CGFloat halfW = CGRectGetWidth(self.bounds) / 2.0;
+    CGFloat halfH = CGRectGetHeight(self.bounds) / 2.0;
+    CGFloat minX = CGRectGetMinX(bounds) + safeInsets.left + halfW + kFloatingButtonMargin;
+    CGFloat maxX = CGRectGetMaxX(bounds) - safeInsets.right - halfW - kFloatingButtonMargin;
+    CGFloat minY = CGRectGetMinY(bounds) + safeInsets.top + halfH + kFloatingButtonMargin;
+    CGFloat maxY = CGRectGetMaxY(bounds) - safeInsets.bottom - halfH - kFloatingButtonMargin;
+    center.x = MIN(MAX(center.x, minX), maxX);
+    center.y = MIN(MAX(center.y, minY), maxY);
+    self.center = center;
+    [pan setTranslation:CGPointZero inView:container];
 }
 @end
 
@@ -473,8 +498,8 @@ static void bdas_init(void) {
         g_windowDidBecomeVisibleObserver = [center addObserverForName:UIWindowDidBecomeVisibleNotification
                                                                object:nil
                                                                 queue:[NSOperationQueue mainQueue]
-                                                           usingBlock:^(NSNotification *notification) {
-            if (notification.object != g_floatWindow) scheduleButtonAttachment();
+                                                           usingBlock:^(__unused NSNotification *notification) {
+            scheduleButtonAttachment();
         }];
 
         hidBackendReady();
