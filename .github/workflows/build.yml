@@ -24,6 +24,7 @@ jobs:
             -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
             -framework Foundation \
             -framework UIKit \
+            -framework CoreGraphics \
             -framework IOKit \
             -o BAutoSwipe_arm64.dylib \
             BAutoSwipe.m
@@ -38,6 +39,7 @@ jobs:
             -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
             -framework Foundation \
             -framework UIKit \
+            -framework CoreGraphics \
             -framework IOKit \
             -o BAutoSwipe_arm64e.dylib \
             BAutoSwipe.m
