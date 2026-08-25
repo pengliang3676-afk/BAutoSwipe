@@ -1,0 +1,55 @@
+name: Build BAutoSwipe
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'BAutoSwipe.m'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build arm64
+        run: |
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -fobjc-arc \
+            -dynamiclib \
+            -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+            -framework Foundation \
+            -framework UIKit \
+            -framework IOKit \
+            -o BAutoSwipe_arm64.dylib \
+            BAutoSwipe.m
+
+      - name: Build arm64e
+        run: |
+          xcrun --sdk iphoneos clang \
+            -arch arm64e \
+            -miphoneos-version-min=15.0 \
+            -fobjc-arc \
+            -dynamiclib \
+            -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+            -framework Foundation \
+            -framework UIKit \
+            -framework IOKit \
+            -o BAutoSwipe_arm64e.dylib \
+            BAutoSwipe.m
+
+      - name: Create fat binary
+        run: |
+          xcrun lipo -create BAutoSwipe_arm64.dylib BAutoSwipe_arm64e.dylib -output BAutoSwipe_1.0.0.dylib
+          xcrun lipo -info BAutoSwipe_1.0.0.dylib
+          codesign --force --sign - BAutoSwipe_1.0.0.dylib
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BAutoSwipe_1.0.0
+          path: BAutoSwipe_1.0.0.dylib
