@@ -7,11 +7,46 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <IOKit/hid/IOHIDEvent.h>
-#import <IOKit/hid/IOHIDEventTypes.h>
-#import <IOKit/hid/IOHIDEventData.h>
 #import <mach/mach_time.h>
 #import <dlfcn.h>
+
+// The iPhoneOS SDK ships IOKit but omits these private HID declarations.
+// Keep the minimal ABI declarations here so GitHub's stock Xcode can compile.
+typedef double IOHIDFloat;
+typedef uint32_t IOHIDEventOptionBits;
+typedef uint32_t IOHIDEventField;
+typedef uint32_t IOHIDDigitizerEventMask;
+typedef uint32_t IOHIDDigitizerTransducerType;
+typedef struct __IOHIDEvent *IOHIDEventRef;
+
+enum {
+    kIOHIDEventOptionNone = 0,
+    kIOHIDDigitizerEventRange = 1 << 0,
+    kIOHIDDigitizerEventTouch = 1 << 1,
+    kIOHIDDigitizerEventPosition = 1 << 2,
+    kIOHIDDigitizerEventCancel = 1 << 7,
+    kIOHIDDigitizerTransducerTypeHand = 3,
+    kIOHIDEventFieldDigitizerEventMask = (11 << 16) + 7,
+};
+
+extern IOHIDEventRef IOHIDEventCreateDigitizerEvent(
+    CFAllocatorRef allocator, uint64_t timestamp,
+    IOHIDDigitizerTransducerType type, uint32_t index, uint32_t identity,
+    IOHIDDigitizerEventMask eventMask, uint32_t buttonMask,
+    IOHIDFloat x, IOHIDFloat y, IOHIDFloat z, IOHIDFloat pressure,
+    IOHIDFloat twist, boolean_t range, boolean_t touch,
+    IOHIDEventOptionBits options);
+extern IOHIDEventRef IOHIDEventCreateDigitizerFingerEvent(
+    CFAllocatorRef allocator, uint64_t timestamp, uint32_t index,
+    uint32_t identity, IOHIDDigitizerEventMask eventMask,
+    IOHIDFloat x, IOHIDFloat y, IOHIDFloat z, IOHIDFloat pressure,
+    IOHIDFloat twist, boolean_t range, boolean_t touch,
+    IOHIDEventOptionBits options);
+extern void IOHIDEventSetIntegerValue(IOHIDEventRef event,
+                                       IOHIDEventField field, CFIndex value);
+extern void IOHIDEventAppendEvent(IOHIDEventRef parent,
+                                  IOHIDEventRef child,
+                                  IOHIDEventOptionBits options);
 
 // ===== 配置 =====
 static const NSInteger kMaxSwipes = 500;        // 最多滑动次数
@@ -62,33 +97,36 @@ static UIEnqueueHIDEventFunc getEnqueueFunc(void) {
 
 // ===== IOHIDEvent 触摸模拟 =====
 
-static uint64_t nowNanos(void) {
-    mach_timebase_info_data_t info;
-    mach_timebase_info(&info);
-    uint64_t ticks = mach_absolute_time();
-    return ticks * info.numer / info.denom;
+static uint64_t nowMachTime(void) {
+    return mach_absolute_time();
 }
 
-static IOHIDEventRef createDigitizerEvent(uint64_t timestamp) {
+static IOHIDEventRef createDigitizerEvent(uint64_t timestamp,
+                                           IOHIDDigitizerEventMask eventMask,
+                                           BOOL isTouching) {
     return IOHIDEventCreateDigitizerEvent(
         kCFAllocatorDefault, timestamp,
         kIOHIDDigitizerTransducerTypeHand,
         0,  // index
         0,  // identity
-        kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch,
-        0, 0, 0, 0, 0, 0, 0, 0, 0,
-        false, 0
+        eventMask,
+        0,  // button mask
+        0, 0, 0, 0, 0,
+        isTouching, isTouching,
+        kIOHIDEventOptionNone
     );
 }
 
 static IOHIDEventRef createFingerEvent(uint64_t timestamp, int fingerId,
-                                       BOOL isTip, BOOL isUp,
+                                       IOHIDDigitizerEventMask eventMask,
+                                       BOOL isTouching,
                                        CGFloat x, CGFloat y, CGFloat pressure) {
     return IOHIDEventCreateDigitizerFingerEvent(
         kCFAllocatorDefault, timestamp,
-        fingerId, isTip, isUp,
+        fingerId, fingerId, eventMask,
         x, y, 0.0, pressure,
-        0.0, 0.0, false
+        0.0, isTouching, isTouching,
+        kIOHIDEventOptionNone
     );
 }
 
@@ -96,19 +134,18 @@ static void sendTouchEvent(int fingerId, UITouchPhase phase, CGFloat x, CGFloat 
     UIEnqueueHIDEventFunc enqueue = getEnqueueFunc();
     if (!enqueue) return;
 
-    uint64_t ts = nowNanos();
-    IOHIDEventRef digitizer = createDigitizerEvent(ts);
+    uint64_t ts = nowMachTime();
+    BOOL isTouching = !(phase == UITouchPhaseEnded || phase == UITouchPhaseCancelled);
+    IOHIDDigitizerEventMask options = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch;
+    if (phase == UITouchPhaseMoved) options = kIOHIDDigitizerEventPosition;
+    if (phase == UITouchPhaseCancelled) options |= kIOHIDDigitizerEventCancel;
 
-    BOOL isTip = (phase == UITouchPhaseBegan);
-    BOOL isUp = (phase == UITouchPhaseEnded || phase == UITouchPhaseCancelled);
-
-    uint32_t options = kIOHIDDigitizerEventRange;
-    if (phase == UITouchPhaseBegan) options |= kIOHIDDigitizerEventTouch;
+    IOHIDEventRef digitizer = createDigitizerEvent(ts, options, isTouching);
 
     IOHIDEventSetIntegerValue(digitizer, kIOHIDEventFieldDigitizerEventMask, options);
 
-    IOHIDEventRef finger = createFingerEvent(ts, fingerId, isTip, isUp, x, y, pressure);
-    IOHIDEventAppendEvent(digitizer, finger);
+    IOHIDEventRef finger = createFingerEvent(ts, fingerId, options, isTouching, x, y, pressure);
+    IOHIDEventAppendEvent(digitizer, finger, kIOHIDEventOptionNone);
     CFRelease(finger);
 
     enqueue(digitizer);
@@ -120,12 +157,12 @@ static void sendMoveEvent(int fingerId, CGFloat x, CGFloat y) {
     UIEnqueueHIDEventFunc enqueue = getEnqueueFunc();
     if (!enqueue) return;
 
-    uint64_t ts = nowNanos();
-    IOHIDEventRef digitizer = createDigitizerEvent(ts);
-    IOHIDEventSetIntegerValue(digitizer, kIOHIDEventFieldDigitizerEventMask,
-                              kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch);
-    IOHIDEventRef finger = createFingerEvent(ts, fingerId, NO, NO, x, y, 0.03);
-    IOHIDEventAppendEvent(digitizer, finger);
+    uint64_t ts = nowMachTime();
+    IOHIDDigitizerEventMask options = kIOHIDDigitizerEventPosition;
+    IOHIDEventRef digitizer = createDigitizerEvent(ts, options, YES);
+    IOHIDEventSetIntegerValue(digitizer, kIOHIDEventFieldDigitizerEventMask, options);
+    IOHIDEventRef finger = createFingerEvent(ts, fingerId, options, YES, x, y, 0.03);
+    IOHIDEventAppendEvent(digitizer, finger, kIOHIDEventOptionNone);
     CFRelease(finger);
 
     enqueue(digitizer);
